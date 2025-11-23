@@ -1,0 +1,131 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\LiveSession;
+use App\Services\OcrSpaceService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
+
+class TelegramController extends Controller
+{
+    protected $ocrService;
+    protected $botToken;
+
+    public function __construct(OcrSpaceService $ocrService)
+    {
+        $this->ocrService = $ocrService;
+        $this->botToken = env('TELEGRAM_BOT_TOKEN');
+    }
+
+    /**
+     * Handle incoming Telegram webhook
+     */
+    public function handle(Request $request)
+    {
+        $update = $request->all();
+        Log::info('Telegram Webhook', $update);
+
+        // Cek apakah ada gambar
+        if (isset($update['message']['photo'])) {
+            $this->handlePhoto($update);
+        } else {
+            $this->sendMessage($update['message']['chat']['id'], 'Kirim screenshot GMV Anda!');
+        }
+
+        return response()->json(['ok' => true]);
+    }
+
+    /**
+     * Handle photo/screenshot dari Telegram
+     */
+    protected function handlePhoto($update)
+    {
+        $chatId = $update['message']['chat']['id'];
+        $photos = $update['message']['photo'];
+        
+        // Kirim pesan "sedang diproses"
+        $this->sendMessage($chatId, "📸 Gambar diterima! Sedang memproses OCR...");
+        
+        // Ambil foto dengan resolusi tertinggi
+        $photo = end($photos);
+        $fileId = $photo['file_id'];
+
+        try {
+            Log::info('Processing photo', ['file_id' => $fileId, 'chat_id' => $chatId]);
+            
+            // Download foto dari Telegram
+            $file = $this->getFile($fileId);
+            $filePath = $file['file_path'];
+            
+            Log::info('File path obtained', ['path' => $filePath]);
+            
+            // Download gambar
+            $imageUrl = "https://api.telegram.org/file/bot{$this->botToken}/{$filePath}";
+            $imageContent = file_get_contents($imageUrl);
+            
+            // Simpan ke storage
+            $savedPath = 'screenshots/' . uniqid() . '.jpg';
+            Storage::put($savedPath, $imageContent);
+            
+            Log::info('Image saved', ['path' => $savedPath]);
+            
+            // Proses OCR
+            $this->sendMessage($chatId, "🔍 Mengekstrak data GMV...");
+            
+            $result = $this->ocrService->extractGmv($savedPath); // Bukan storage_path('app/' . $savedPath)
+            
+            Log::info('OCR Result', $result);
+            
+            if ($result['success']) {
+                $gmv = $result['gmv'];
+                
+                $message = "✅ *GMV Terdeteksi!*\n\n";
+                $message .= "💰 GMV: Rp " . number_format($gmv, 0, ',', '.') . "\n\n";
+                $message .= "📝 Teks yang terdeteksi:\n";
+                $message .= "```\n" . substr($result['raw_text'], 0, 200) . "...\n```";
+                
+                $this->sendMessage($chatId, $message, true);
+            } else {
+                $this->sendMessage($chatId, "❌ Gagal mendeteksi GMV\n\n" . 
+                    "Alasan: " . $result['message'] . "\n\n" .
+                    "Tips: Pastikan screenshot jelas dan ada angka GMV yang terlihat.");
+            }
+            
+        } catch (\Exception $e) {
+            Log::error('Telegram Photo Error: ' . $e->getMessage());
+            $this->sendMessage($chatId, "❌ Terjadi kesalahan:\n" . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get file info dari Telegram
+     */
+    protected function getFile($fileId)
+    {
+        $response = Http::get("https://api.telegram.org/bot{$this->botToken}/getFile", [
+            'file_id' => $fileId
+        ]);
+
+        return $response->json()['result'];
+    }
+
+    /**
+     * Kirim pesan ke Telegram
+     */
+    protected function sendMessage($chatId, $text, $markdown = false)
+    {
+        $params = [
+            'chat_id' => $chatId,
+            'text' => $text
+        ];
+        
+        if ($markdown) {
+            $params['parse_mode'] = 'Markdown';
+        }
+        
+        Http::post("https://api.telegram.org/bot{$this->botToken}/sendMessage", $params);
+    }
+}
